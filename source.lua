@@ -1,4 +1,4 @@
---// Optimized build (performance pass)
+--// Optimized v3 build (unified input dispatcher + cleanup)
 --// Written by depso
 --// MIT License
 --// Copyright (c) 2024 Depso
@@ -194,6 +194,12 @@ local AddionalStyles = {
 	end,
 }
 
+--// Cached flat list of additional styles (avoids table iteration overhead)
+local AdditionalStylesList = {}
+for Info, Callback in next, AddionalStyles do
+	AdditionalStylesList[#AdditionalStylesList+1] = {Info = Info, Callback = Callback}
+end
+
 function ImGui:GetName(Name: string)
 	local Format = "%s_"
 	return Format:format(Name)
@@ -223,7 +229,8 @@ function ImGui:ApplyColors(ColorOverwrites, GuiObject: GuiObject, ElementType: s
 
 			if not Element then 
 				if ElementType == "Window" then
-					Element = GuiObject.Content:FindFirstChild(Key, Recursive)
+					local Content = GuiObject.Content
+					Element = Content and Content:FindFirstChild(Key, Recursive)
 					if not Element then continue end
 				else 
 					warn(Key, "was not found in", GuiObject)
@@ -244,7 +251,10 @@ end
 
 function ImGui:CheckStyles(GuiObject: GuiObject, Class, Colors)
 	--// Addional styles
-	for Info, Callback in next, AddionalStyles do
+	for i = 1, #AdditionalStylesList do
+		local Entry = AdditionalStylesList[i]
+		local Info = Entry.Info
+		local Callback = Entry.Callback
 		local Value = Class[Info.Name]
 		local Aliases = Info.Aliases
 
@@ -277,8 +287,9 @@ function ImGui:CheckStyles(GuiObject: GuiObject, Class, Colors)
 		ImGui:ApplyColors(ColorOverwrites, GuiObject, ElementType)
 	end
 
-	--// Set properties
+	--// Set properties (skip class methods to avoid wasted pcall failures)
 	for Key, Value in next, Class do
+		if typeof(Value) == "function" then continue end
 		pcall(function() --// If the property does not exist
 			GuiObject[Key] = Value
 		end)
@@ -289,6 +300,11 @@ function ImGui:MergeMetatables(Class, Instance: GuiObject)
 	local Metadata = {}
 	local BoundCache = {}
 	Metadata.__index = function(self, Key)
+		--// Fast path for class methods (avoid pcall)
+		local ClassValue = Class[Key]
+		if typeof(ClassValue) == "function" then
+			return ClassValue
+		end
 		local ok, Value = pcall(function()
 			return Instance[Key]
 		end)
@@ -305,7 +321,7 @@ function ImGui:MergeMetatables(Class, Instance: GuiObject)
 			end
 			return Value
 		end
-		return Class[Key]
+		return ClassValue
 	end
 
 	Metadata.__newindex = function(self, Key, Value)
@@ -978,7 +994,10 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 			if not Dragging then return end
 			if inputObject.UserInputType == Enum.UserInputType.MouseButton1 then
 				Dragging = false
-				MouseMoveConnection:Disconnect()
+				if MouseMoveConnection then
+					MouseMoveConnection:Disconnect()
+					MouseMoveConnection = nil
+				end
 			end
 		end)
 
@@ -1033,14 +1052,14 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 
 		Keybind.Activated:Connect(function()
 			ValueText.Text = "..."
-			local NewKey = UserInputService.InputBegan:wait()
+			local NewKey = UserInputService.InputBegan:Wait()
 			if not UserInputService.WindowFocused then return end 
 
 			if NewKey.KeyCode.Name == "Unknown" then
 				return Config:SetValue(Key)
 			end
 
-			wait(.1) --// 👍
+			task.wait(0.1) --// 👍
 			Config:SetValue(NewKey.KeyCode)
 		end)
 
@@ -1290,108 +1309,70 @@ function ImGui:HeaderAnimate(Header: Instance, Animation, Open, TitleBar: Instan
 	end)
 end
 
-function ImGui:ApplyDraggable(Frame: Frame, Header: Frame)
-	local tweenInfo = ImGui:GetAnimation(true)
-	local Header = Header or Frame
+--// Unified input dispatcher: ONE set of global connections for drag + resize
+local DragRegistry = {}
+local ResizableRegistry = {}
+local InputDispatchConnected = false
+local function EnsureInputDispatch()
+	if InputDispatchConnected then return end
+	InputDispatchConnected = true
 
-	local Dragging = false
-	local KeyBeganPos = nil
-	local BeganPos = Frame.Position
-
-	--// Whitelist
-	local UserInputTypes = {
-		Enum.UserInputType.MouseButton1,
-		Enum.UserInputType.Touch
-	}
-
-	local function UserInputTypeAllowed(InputType: Enum.UserInputType)
-		return table.find(UserInputTypes, InputType)
+	local function RunDragMovement(Input)
+		for i = 1, #DragRegistry do
+			local State = DragRegistry[i]
+			if State and State.Active and State.Dragging and State.KeyBeganPos then
+				local Delta = Input.Position - State.KeyBeganPos
+				State.Frame.Position = UDim2.new(
+					State.BeganPos.X.Scale,
+					State.BeganPos.X.Offset + Delta.X,
+					State.BeganPos.Y.Scale,
+					State.BeganPos.Y.Offset + Delta.Y
+				)
+			end
+		end
 	end
 
-	--// Debounce 
-	Header.InputBegan:Connect(function(Key)
-		if UserInputTypeAllowed(Key.UserInputType) then
-			Dragging = true
-			KeyBeganPos = Key.Position
-			BeganPos = Frame.Position
+	UserInputService.TouchMoved:Connect(RunDragMovement)
+	UserInputService.InputChanged:Connect(function(Input)
+		if Input.UserInputType == Enum.UserInputType.MouseMovement then
+			RunDragMovement(Input)
+		end
+		--// Resizable movement (only on mouse movement)
+		if Input.UserInputType == Enum.UserInputType.MouseMovement then
+			for i = 1, #ResizableRegistry do
+				local State = ResizableRegistry[i]
+				if State and State.Active and State.DragStart then
+					local MousePos = Vector2.new(Mouse.X, Mouse.Y)
+					local mouseMoved = MousePos - State.DragStart
+					local NewSize = State.OriginalSize + mouseMoved
+					NewSize = UDim2.fromOffset(
+						math.max(State.MinSize.X, NewSize.X),
+						math.max(State.MinSize.Y, NewSize.Y)
+					)
+					if State.Frame.Size ~= NewSize then
+						State.Frame.Size = NewSize
+					end
+					if State.Config then
+						State.Config.Size = NewSize
+					end
+				end
+			end
 		end
 	end)
-
 	UserInputService.InputEnded:Connect(function(Key)
-		if UserInputTypeAllowed(Key.UserInputType) then
-			Dragging = false
+		for i = 1, #DragRegistry do
+			local State = DragRegistry[i]
+			if State and State.Active and table.find(State.UserInputTypes, Key.UserInputType) then
+				State.Dragging = false
+			end
+		end
+		if Key.UserInputType == Enum.UserInputType.MouseButton1 then
+			for i = 1, #ResizableRegistry do
+				local State = ResizableRegistry[i]
+				if State and State.Active then State.DragStart = nil end
+			end
 		end
 	end)
-
-	--// Dragging
-	local function Movement(Input)
-		if not Dragging then return end
-
-		local Delta = Input.Position - KeyBeganPos
-		Frame.Position = UDim2.new(
-			BeganPos.X.Scale, 
-			BeganPos.X.Offset + Delta.X, 
-			BeganPos.Y.Scale, 
-			BeganPos.Y.Offset + Delta.Y
-		)
-	end
-
-	--// Connect movement events
-	UserInputService.TouchMoved:Connect(Movement)
-	UserInputService.InputChanged:Connect(function(Input)
-		if Input.UserInputType == Enum.UserInputType.MouseMovement then 
-			return Movement(Input)
-		end
-	end)
-end
-
-
-function ImGui:ApplyResizable(MinSize, Frame: Frame, Dragger: TextButton, Config)
-	local DragStart
-	local OrignialSize
-
-	MinSize = MinSize or Vector2.new(160, 90)
-
-	Dragger.MouseButton1Down:Connect(function()
-		if DragStart then return end
-		OrignialSize = Frame.AbsoluteSize			
-		DragStart = Vector2.new(Mouse.X, Mouse.Y)
-	end)	
-
-	UserInputService.InputChanged:Connect(function(Input)
-		if not DragStart or Input.UserInputType ~= Enum.UserInputType.MouseMovement then 
-			return
-		end
-
-		local MousePos = Vector2.new(Mouse.X, Mouse.Y)
-		local mouseMoved = MousePos - DragStart
-
-		local NewSize = OrignialSize + mouseMoved
-		NewSize = UDim2.fromOffset(
-			math.max(MinSize.X, NewSize.X), 
-			math.max(MinSize.Y, NewSize.Y)
-		)
-
-		if Frame.Size ~= NewSize then
-			Frame.Size = NewSize
-		end
-		if Config then
-			Config.Size = NewSize
-		end
-	end)
-
-	UserInputService.InputEnded:Connect(function(Input)
-		if Input.UserInputType == Enum.UserInputType.MouseButton1 then
-			DragStart = nil
-		end
-	end)	
-end
-
-local HoverInputCallbacks = {}
-local HoverInputConnected = false
-local function EnsureHoverInputConnection()
-	if HoverInputConnected then return end
-	HoverInputConnected = true
 	UserInputService.InputBegan:Connect(function(Input)
 		for i = 1, #HoverInputCallbacks do
 			local cb = HoverInputCallbacks[i]
@@ -1399,6 +1380,60 @@ local function EnsureHoverInputConnection()
 		end
 	end)
 end
+
+function ImGui:ApplyDraggable(Frame: Frame, Header: Frame)
+	local Header = Header or Frame
+
+	local State = {
+		Frame = Frame,
+		Dragging = false,
+		KeyBeganPos = nil,
+		BeganPos = Frame.Position,
+		Active = true,
+		UserInputTypes = {
+			Enum.UserInputType.MouseButton1,
+			Enum.UserInputType.Touch
+		},
+	}
+	DragRegistry[#DragRegistry+1] = State
+	EnsureInputDispatch()
+
+	Frame.Destroying:Connect(function() State.Active = false end)
+
+	Header.InputBegan:Connect(function(Key)
+		if table.find(State.UserInputTypes, Key.UserInputType) then
+			State.Dragging = true
+			State.KeyBeganPos = Key.Position
+			State.BeganPos = Frame.Position
+		end
+	end)
+end
+
+function ImGui:ApplyResizable(MinSize, Frame: Frame, Dragger: TextButton, Config)
+	MinSize = MinSize or Vector2.new(160, 90)
+	local State = {
+		Frame = Frame,
+		Config = Config,
+		MinSize = MinSize,
+		DragStart = nil,
+		OriginalSize = nil,
+		Active = true,
+	}
+	ResizableRegistry[#ResizableRegistry+1] = State
+	EnsureInputDispatch()
+
+	Frame.Destroying:Connect(function() State.Active = false end)
+
+	Dragger.MouseButton1Down:Connect(function()
+		if State.DragStart then return end
+		State.OriginalSize = Frame.AbsoluteSize
+		State.DragStart = Vector2.new(Mouse.X, Mouse.Y)
+	end)
+end
+
+local HoverInputCallbacks = {}
+--// InputBegan dispatch is handled by the unified dispatcher below
+local HoverInputConnected = true
 
 function ImGui:ConnectHover(Config)
 	local Parent = Config.Parent
@@ -1418,7 +1453,7 @@ function ImGui:ConnectHover(Config)
 		InputCallback = function(Input)
 			return Config.OnInput(Config.Hovering, Input)
 		end
-		EnsureHoverInputConnection()
+		EnsureInputDispatch()
 		HoverInputCallbacks[#HoverInputCallbacks+1] = InputCallback
 	end
 
