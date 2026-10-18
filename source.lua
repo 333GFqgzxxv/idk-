@@ -1,4 +1,4 @@
---// Optimized v3 build (unified input dispatcher + cleanup)
+--// Optimized v4 build (heartbeat animation scheduler + all passes)
 --// Written by depso
 --// MIT License
 --// Copyright (c) 2024 Depso
@@ -69,7 +69,6 @@ local RunService: RunService = GetService("RunService")
 --// LocalPlayer
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer.PlayerGui
-local Mouse = LocalPlayer:GetMouse()
 
 --// ImGui Config
 local IsStudio = RunService:IsStudio()
@@ -206,9 +205,12 @@ function ImGui:GetName(Name: string)
 end
 
 function ImGui:CreateInstance(Class, Parent, Properties)
-	local Instance = Instance.new(Class, Parent)
+	local Instance = Instance.new(Class)
 	for Key, Value in next, Properties or {} do
 		Instance[Key] = Value
+	end
+	if Parent then
+		Instance.Parent = Parent
 	end
 	return Instance
 end
@@ -337,11 +339,11 @@ function ImGui:MergeMetatables(Class, Instance: GuiObject)
 end
 
 function ImGui:Concat(Table, Separator: " ") 
-	local Concatenated = ""
+	local Parts = table.create(#Table)
 	for Index, String in next, Table do
-		Concatenated ..= tostring(String) .. (Index ~= #Table and Separator or "")
+		Parts[Index] = tostring(String)
 	end
-	return Concatenated
+	return table.concat(Parts, Separator or "")
 end
 
 function ImGui:ContainerClass(Frame: Frame, Class, Window)
@@ -673,8 +675,8 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 			return Config
 		end
 
-		--// Connect events
-		Source.Changed:Connect(Config.UpdateLineNumbers)
+		--// Connect events (only rebuild line numbers on Text change)
+		Source:GetPropertyChangedSignal("Text"):Connect(Config.UpdateLineNumbers)
 
 		return self:NewInstance(Console, Config)
 	end
@@ -960,14 +962,15 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 
 		local Dragging = false
 		local MouseMoveConnection = nil
+		local CachedLeftPos = 0
+		local CachedWidth = 1
 
 		local function MouseMove()
 			if Config.ReadOnly then return end
 			if not Dragging then return end
 			local MouseX = UserInputService:GetMouseLocation().X
-			local LeftPos = Slider.AbsolutePosition.X
 
-			local Percentage = (MouseX-LeftPos)/Slider.AbsoluteSize.X
+			local Percentage = (MouseX-CachedLeftPos)/CachedWidth
 			Percentage = math.clamp(Percentage, 0, 1)
 			if Percentage == Config._lastDragPct then return end
 			Config._lastDragPct = Percentage
@@ -981,9 +984,15 @@ function ImGui:ContainerClass(Frame: Frame, Class, Window)
 				if not MouseHovering then return end
 				if Input.UserInputType == Enum.UserInputType.MouseButton1 then
 					Dragging = true
+					CachedLeftPos = Slider.AbsolutePosition.X
+					CachedWidth = Slider.AbsoluteSize.X
 
 					--// Save heavy performance
-					MouseMoveConnection = Mouse.Move:Connect(MouseMove)
+					MouseMoveConnection = UserInputService.InputChanged:Connect(function(Input)
+						if Input.UserInputType == Enum.UserInputType.MouseMovement then
+							MouseMove()
+						end
+					end)
 				end
 			end
 		})
@@ -1219,25 +1228,164 @@ function ImGui:GetAnimation(Animation: boolean?)
 	return Animation and self.Animation or TweenInfo.new(0)
 end
 
+--// Heartbeat animation scheduler (replaces TweenService:Create per call)
+local ActiveAnims = {}
+local AnimHeartbeatConnected = false
+
+local function EaseQuad(t, style, direction)
+	-- style ignored; supports Quad In/Out/InOut via direction
+	if direction == Enum.EasingDirection.In then
+		return t * t
+	elseif direction == Enum.EasingDirection.InOut then
+		if t < 0.5 then return 2 * t * t end
+		return 1 - ((-2 * t + 2) ^ 2) / 2
+	else -- Out
+		return 1 - (1 - t) * (1 - t)
+	end
+end
+
+local function LerpValue(start, target, t)
+	local st = typeof(start)
+	if st == typeof(target) then
+		if st == "number" then
+			return start + (target - start) * t
+		elseif st == "UDim2" then
+			return UDim2.new(
+				start.X.Scale + (target.X.Scale - start.X.Scale) * t,
+				start.X.Offset + (target.X.Offset - start.X.Offset) * t,
+				start.Y.Scale + (target.Y.Scale - start.Y.Scale) * t,
+				start.Y.Offset + (target.Y.Offset - start.Y.Offset) * t
+			)
+		elseif st == "Color3" then
+			return Color3.new(
+				start.R + (target.R - start.R) * t,
+				start.G + (target.G - start.G) * t,
+				start.B + (target.B - start.B) * t
+			)
+		elseif st == "Vector2" then
+			return Vector2.new(start.X + (target.X - start.X) * t, start.Y + (target.Y - start.Y) * t)
+		elseif st == "Vector3" then
+			return Vector3.new(start.X + (target.X - start.X) * t, start.Y + (target.Y - start.Y) * t, start.Z + (target.Z - start.Z) * t)
+		elseif st == "UDim" then
+			return UDim.new(start.Scale + (target.Scale - start.Scale) * t, start.Offset + (target.Offset - start.Offset) * t)
+		end
+	end
+	-- non-animatable: snap at halfway
+	if t >= 0.5 then return target end
+	return start
+end
+
+local function EnsureAnimHeartbeat()
+	if AnimHeartbeatConnected then return end
+	AnimHeartbeatConnected = true
+	RunService.Heartbeat:Connect(function(dt)
+		-- process
+		local i = 1
+		while i <= #ActiveAnims do
+			local anim = ActiveAnims[i]
+			anim.Elapsed = anim.Elapsed + dt
+			local t = anim.Elapsed / anim.Duration
+			if t >= 1 then t = 1 end
+			local eased = EaseQuad(t, anim.TweenInfo and anim.TweenInfo.EasingStyle, anim.TweenInfo and anim.TweenInfo.EasingDirection)
+			local value = LerpValue(anim.Start, anim.Target, eased)
+			pcall(function() anim.Instance[anim.Key] = value end)
+			if t >= 1 then
+				-- remove
+				table.remove(ActiveAnims, i)
+				-- check if all props for handle done
+				local handle = anim.Handle
+				local anyLeft = false
+				for j = 1, #ActiveAnims do
+					if ActiveAnims[j].Handle == handle then anyLeft = true; break end
+				end
+				if not anyLeft and handle and handle._callbacks then
+					for _, cb in ipairs(handle._callbacks) do
+						task.defer(cb)
+					end
+					handle._callbacks = {}
+				end
+			else
+				i = i + 1
+			end
+		end
+	end)
+end
+
 local ActiveTweens = setmetatable({}, {__mode = "k"})
 function ImGui:Tween(Instance: GuiObject, Props: SharedTable, tweenInfo, NoAnimation: false)
 	local tweenInfo = tweenInfo or ImGui:GetAnimation(not NoAnimation)
-	local Prev = ActiveTweens[Instance]
-	if Prev then
-		pcall(function() Prev:Cancel() end)
-	end
-	local Tween = TweenService:Create(Instance, 
-		tweenInfo,
-		Props
-	)
-	ActiveTweens[Instance] = Tween
-	Tween.Completed:Connect(function()
-		if ActiveTweens[Instance] == Tween then
-			ActiveTweens[Instance] = nil
+	local duration = (tweenInfo and tweenInfo.Time) or 0
+	if NoAnimation then duration = 0 end
+
+	-- cancel previous anims on same instance
+	for i = #ActiveAnims, 1, -1 do
+		if ActiveAnims[i].Instance == Instance then
+			table.remove(ActiveAnims, i)
 		end
-	end)
-	Tween:Play()
-	return Tween
+	end
+
+	local handle = {
+		Instance = Instance,
+		_callbacks = {},
+		Completed = nil,
+	}
+	handle.Completed = {
+		Connect = function(_, cb)
+			handle._callbacks[#handle._callbacks+1] = cb
+		end,
+	}
+	function handle:Play() end
+	function handle:Cancel()
+		for i = #ActiveAnims, 1, -1 do
+			if ActiveAnims[i].Instance == Instance then
+				table.remove(ActiveAnims, i)
+			end
+		end
+	end
+
+	if duration <= 0 then
+		for Key, Value in pairs(Props) do
+			pcall(function() Instance[Key] = Value end)
+		end
+		-- fire completed next frame
+		task.defer(function()
+			for _, cb in ipairs(handle._callbacks) do cb() end
+			handle._callbacks = {}
+		end)
+		ActiveTweens[Instance] = handle
+		return handle
+	end
+
+	local AddedAny = false
+	for Key, Target in pairs(Props) do
+		local Start = nil
+		pcall(function() Start = Instance[Key] end)
+		if Start == nil then
+			-- non-readable or nil; apply immediately
+			pcall(function() Instance[Key] = Target end)
+		else
+			ActiveAnims[#ActiveAnims+1] = {
+				Instance = Instance,
+				Key = Key,
+				Start = Start,
+				Target = Target,
+				Duration = duration,
+				Elapsed = 0,
+				TweenInfo = tweenInfo,
+				Handle = handle,
+			}
+			AddedAny = true
+		end
+	end
+	if not AddedAny then
+		task.defer(function()
+			for _, cb in ipairs(handle._callbacks) do cb() end
+			handle._callbacks = {}
+		end)
+	end
+	EnsureAnimHeartbeat()
+	ActiveTweens[Instance] = handle
+	return handle
 end
 
 function ImGui:ApplyAnimations(Instance: GuiObject, Class: string, Target: GuiObject?)
@@ -1338,11 +1486,11 @@ local function EnsureInputDispatch()
 			RunDragMovement(Input)
 		end
 		--// Resizable movement (only on mouse movement)
-		if Input.UserInputType == Enum.UserInputType.MouseMovement then
+		if Input.UserInputType == Enum.UserInputType.MouseMovement and #ResizableRegistry > 0 then
 			for i = 1, #ResizableRegistry do
 				local State = ResizableRegistry[i]
 				if State and State.Active and State.DragStart then
-					local MousePos = Vector2.new(Mouse.X, Mouse.Y)
+					local MousePos = Vector2.new(Input.Position.X, Input.Position.Y)
 					local mouseMoved = MousePos - State.DragStart
 					local NewSize = State.OriginalSize + mouseMoved
 					NewSize = UDim2.fromOffset(
@@ -1395,6 +1543,12 @@ function ImGui:ApplyDraggable(Frame: Frame, Header: Frame)
 			Enum.UserInputType.Touch
 		},
 	}
+	--// Compact inactive entries
+	for i = #DragRegistry, 1, -1 do
+		if not DragRegistry[i].Active then
+			table.remove(DragRegistry, i)
+		end
+	end
 	DragRegistry[#DragRegistry+1] = State
 	EnsureInputDispatch()
 
@@ -1419,6 +1573,11 @@ function ImGui:ApplyResizable(MinSize, Frame: Frame, Dragger: TextButton, Config
 		OriginalSize = nil,
 		Active = true,
 	}
+	for i = #ResizableRegistry, 1, -1 do
+		if not ResizableRegistry[i].Active then
+			table.remove(ResizableRegistry, i)
+		end
+	end
 	ResizableRegistry[#ResizableRegistry+1] = State
 	EnsureInputDispatch()
 
@@ -1427,13 +1586,12 @@ function ImGui:ApplyResizable(MinSize, Frame: Frame, Dragger: TextButton, Config
 	Dragger.MouseButton1Down:Connect(function()
 		if State.DragStart then return end
 		State.OriginalSize = Frame.AbsoluteSize
-		State.DragStart = Vector2.new(Mouse.X, Mouse.Y)
+		local MousePos = UserInputService:GetMouseLocation()
+		State.DragStart = Vector2.new(MousePos.X, MousePos.Y)
 	end)
 end
 
 local HoverInputCallbacks = {}
---// InputBegan dispatch is handled by the unified dispatcher below
-local HoverInputConnected = true
 
 function ImGui:ConnectHover(Config)
 	local Parent = Config.Parent
@@ -1634,6 +1792,7 @@ function ImGui:CreateWindow(WindowConfig)
 		return self
 	end
 	function WindowConfig:Remove()
+		ImGui.Windows[Window] = nil
 		Window:Remove()
 		return self
 	end
