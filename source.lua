@@ -3338,6 +3338,14 @@ run(function() -- Main Cheat
 	end
 
 	if not cameraInterface then
+		for name, mod in modules do
+			if type(mod) == "table" and (rawget(mod, "getActiveCamera") or rawget(mod, "setCameraType")) then
+				cameraInterface = mod
+				break
+			end
+		end
+	end
+	if not cameraInterface then
 		for i, v in getgc(true) do
 			if type(v) == "table" and rawget(v, "setCameraType") and rawget(v, "getActiveCamera") then
 				cameraInterface = v
