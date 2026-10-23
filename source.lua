@@ -3328,6 +3328,30 @@ run(function() -- Main Cheat
 	local replicationInterface = modules.ReplicationInterface
 	local crosshairsInterface = modules.HudCrosshairsInterface
 
+	if not replicationObject then
+		for name, mod in modules do
+			if type(mod) == "table" and type(name) == "string" and string.lower(name):find("replic") and rawget(mod, "new") then
+				replicationObject = mod
+				break
+			end
+		end
+	end
+	if not replicationObject then
+		for name, mod in modules do
+			if type(mod) == "table" and rawget(mod, "new") and (rawget(mod, "spawn") or rawget(mod, "despawn") or rawget(mod, "step")) then
+				replicationObject = mod
+				break
+			end
+		end
+	end
+	if not replicationObject then
+		for i, v in getgc(true) do
+			if type(v) == "table" and rawget(v, "new") and (rawget(v, "spawn") or rawget(v, "despawn")) then
+				replicationObject = v
+				break
+			end
+		end
+	end
 	--local networkConnections = debug.getupvalue(debug.getupvalue(network._init, 2), 2)
 	local networkConnections
 	for i, v in getgc(true) do
@@ -3418,7 +3442,8 @@ run(function() -- Main Cheat
 	--fakeRepObject = replicationObject.new(localplayer)
 	--debug.setupvalue(replicationObject.new, 3, localplayer)
 
-	fakeRepObject = replicationObject.new(setmetatable({}, {
+	if replicationObject then
+		fakeRepObject = replicationObject.new(setmetatable({}, {
 		__index = function(self, index)
 			if index == "GetPropertyChangedSignal" then
 				return function(_, property)
@@ -3433,6 +3458,7 @@ run(function() -- Main Cheat
 			return
 		end
 	}))
+	end
 
 	--local astar = loadstring(game:HttpGet("https://raw.githubusercontent.com/jensonhirst/Sirius/request/library/Pathfinding"))() -- fucking flies so it despawns now. ill make pathfinding that stays on the ground
 	--astar.maxtime = 0.33
