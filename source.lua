@@ -3337,8 +3337,37 @@ run(function() -- Main Cheat
 		end
 	end
 
-	getfenv(cameraInterface.setCameraType).print = function() end -- fix third person console spam
-	getfenv(cameraInterface.setCameraType).warn = function() end
+	if not cameraInterface then
+		for i, v in getgc(true) do
+			if type(v) == "table" and rawget(v, "setCameraType") and rawget(v, "getActiveCamera") then
+				cameraInterface = v
+				break
+			end
+		end
+	end
+	if not cameraInterface then
+		for i, v in getgc(true) do
+			if type(v) == "table" and rawget(v, "getActiveCamera") then
+				cameraInterface = v
+				break
+			end
+		end
+	end
+	if not cameraInterface and cameraObject and rawget(cameraObject, "getActiveCamera") then
+		cameraInterface = cameraObject
+	end
+	if not cameraInterface then
+		for i, v in getgc(true) do
+			if type(v) == "function" and debug.getinfo and debug.getinfo(v).name == "setCameraType" then
+				cameraInterface = debug.getupvalue(v, 1) or cameraInterface
+				break
+			end
+		end
+	end
+	if cameraInterface then
+		getfenv(cameraInterface.setCameraType).print = function() end -- fix third person console spam
+		getfenv(cameraInterface.setCameraType).warn = function() end
+	end
 
 	local players = game:GetService("Players")
 	local lighting = game:GetService("Lighting")
