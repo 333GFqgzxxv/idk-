@@ -525,7 +525,12 @@ run(function()
 
 			lastRender = tick();
 			for shapeIndex, updateList in cache.updates do
-				local shape = cache.shapes[shapeIndex]._data
+				local shapeWrapper = cache.shapes[shapeIndex]
+				if not shapeWrapper or not shapeWrapper._data then
+					cache.updates[shapeIndex] = nil
+					continue
+				end
+				local shape = shapeWrapper._data
 
 				if shape.shape == "Line" then
 					local line = shape.drawings.line
@@ -3418,7 +3423,7 @@ run(function() -- Main Cheat
 
 	local backtrackObjects = Instance.new("Folder", workspace)
 	local hitboxObjects = Instance.new("Folder", workspace)
-	local drawing = drawing or Drawing or getgenv().drawing
+	local drawing = Drawing
 	local aimbotfov = drawing.new("Circle")
 	local aimbotdeadfov = drawing.new("Circle")
 	local silentaimfov = drawing.new("Circle")
